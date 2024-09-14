@@ -273,7 +273,7 @@ def add_question(em: discord.Embed, question: Question, current_length: int) -> 
     # chars rather than 1000.
     if sum([len(line) for line in question_lines]) + len(question_lines) * 3 + len(question.answer) <= 900:
         question_block = "\n> ".join(question_lines)
-        formatted_question_text = f"[> {question_block}]({question.jump_url})"
+        formatted_question_text = f"> [{question_block}]({question.jump_url})"
 
         text_length = len(f"Question #{question.question_num}") + len(f"{formatted_question_text}\n{question.answer}")
         if text_length > 4800:
@@ -295,14 +295,14 @@ def add_question(em: discord.Embed, question: Question, current_length: int) -> 
     if current_length + len(question.question) + len(question.answer) > 4700:
         return -1
 
-    question_chunk = "[> "
+    question_chunk = "> ["
     question_chunks = []
     for word in question.question_words():
         if len(question_chunk + word) > 900:
             # question_chunk += f']({question.message.jump_url})'
             question_chunk += f"]({question.jump_url})"
             question_chunks.append(question_chunk)
-            question_chunk = "[> "
+            question_chunk = "> ["
         word = word.replace("\n", "\n> ")
         question_chunk += f"{word}" + " "
     # question_chunk += f']({question.message.jump_url})'
@@ -381,6 +381,22 @@ def _ck_interview_enabled():
             await ctx.send("Interviews are currently disabled.")
             await ctx.message.add_reaction(ctx.bot.redtick)
         return result is not None
+
+    return commands.check(predicate)
+
+
+def _ck_is_manager():
+    """
+    Command check to make sure the invoker is an interview manager.
+
+    Checked when doing routine interview management.
+    """
+    async def predicate(ctx: commands.Context):
+        if ctx.author.guild_permissions.administrator:
+            return True
+        session = session_maker()
+        server = session.query(schema.Server).filter_by(id=ctx.guild.id).one_or_none()
+        return server is not None and server.manager_role_id in {role.id for role in ctx.author.roles}
 
     return commands.check(predicate)
 
@@ -482,8 +498,12 @@ class Interview(commands.Cog):
 
         em = None  # type: Optional[discord.Embed]
         for question in questions:
+            # Three cases where we need to start a new embed:
+            # 1. If the total length of the embed is > max message size
+            # 2. If the number of embed fields > 25
+            # 3. If there's a new asker (only one asker per embed)
             logging.debug(f"generating {question.asker}-{question.question_num}")
-            if last_asker != question.asker:
+            if last_asker != question.asker or len(em.fields) > 23:  # 23 as a buffer idk
                 # new asker, append old embed and make a new one
                 if em is not None and len(em.fields) > 0:
                     ls_embeds.append(finalize(em))
@@ -623,8 +643,34 @@ class Interview(commands.Cog):
         )
         await ctx.message.add_reaction(ctx.bot.greentick)
 
-    @iv.command(name="next")
+    @iv.command(name="setmanager")
     @commands.has_permissions(administrator=True)
+    @_ck_server_active()
+    async def iv_setmanager(self, ctx: commands.Context, role: discord.Role):
+        """
+        Set the interview maanger role.
+        """
+        session = session_maker()
+        server = session.query(schema.Server).filter_by(id=ctx.guild.id).one_or_none()
+        server.manager_role_id = role.id
+        session.commit()
+        await ctx.message.add_reaction(ctx.bot.greentick)
+
+    @iv.command(name="setaudience")
+    @commands.has_permissions(administrator=True)
+    @_ck_server_active()
+    async def iv_setaudience(self, ctx: commands.Context, audience_role: discord.Role):
+        """
+        Set the interview on-stage audience role.
+        """
+        session = session_maker()
+        server = session.query(schema.Server).filter_by(id=ctx.guild.id).one_or_none()
+        server.audience_role_id = audience_role.id
+        session.commit()
+        await ctx.message.add_reaction(ctx.bot.greentick)
+
+    @iv.command(name="next")
+    @_ck_is_manager()
     @_ck_server_active()
     async def iv_next(self, ctx: commands.Context, interviewee: discord.Member, *, email: Optional[str] = None):
         """
@@ -701,6 +747,11 @@ class Interview(commands.Cog):
         # Only commit after the new page is up and old votes are deleted.
         session.commit()
 
+        audience_role: discord.Role = ctx.guild.get_role(server.audience_role_id)
+        if audience_role:
+            for member in audience_role.members:  # type: discord.Member
+                await member.remove_roles(audience_role, reason="interview rollover")
+
         await ctx.message.add_reaction(ctx.bot.greentick)
         await asyncio.sleep(2)
         await ctx.send(f"{ctx.author.mention}, make sure to update the table of contents!")
@@ -723,6 +774,8 @@ class Interview(commands.Cog):
         em.add_field(name="Sheet name", value=f"{server.sheet_name}")
         em.add_field(name="Default question", value=f"{server.default_question}")
         em.add_field(name="Reinterview limit", value=f"{server.limit}")
+        em.add_field(name="Manager", value=f"{ctx.guild.get_role(server.manager_role_id)}")
+        em.add_field(name="On-stage audience", value=f"{ctx.guild.get_role(server.audience_role_id)}")
         await ctx.send(embed=em)
 
     @iv.command(name="overwrite")
@@ -810,7 +863,7 @@ class Interview(commands.Cog):
         await ctx.message.add_reaction(ctx.bot.greentick)
 
     @iv.command(name="disable")
-    @commands.has_permissions(administrator=True)
+    @_ck_is_manager()
     @_ck_server_active()
     async def iv_disable(self, ctx: commands.Context):
         """
@@ -831,7 +884,7 @@ class Interview(commands.Cog):
         await ctx.message.add_reaction(ctx.bot.greentick)
 
     @iv.command(name="enable")
-    @commands.has_permissions(administrator=True)
+    @_ck_is_manager()
     @_ck_server_active()
     async def iv_enable(self, ctx: commands.Context):
         """
@@ -852,7 +905,7 @@ class Interview(commands.Cog):
         await ctx.message.add_reaction(ctx.bot.greentick)
 
     @iv.command(name="limit")
-    @commands.has_permissions(administrator=True)
+    @_ck_is_manager()
     @_ck_server_active()
     async def iv_limit(self, ctx: commands.Context, date: str = None):
         """
@@ -1239,6 +1292,92 @@ class Interview(commands.Cog):
         else:
             channel = ctx.guild.get_channel(server.answer_channel)
         await self._imganswer(ctx, row_num, url, channel)
+
+    # == Manage audience members
+
+    @commands.command()
+    @_ck_server_active()
+    @_ck_is_interviewee()
+    async def grantstage(self, ctx: commands.Context, mentions: commands.Greedy[discord.Member]):
+        """
+        Grant all mentioned users access to the interview stage.
+
+        Usable only by the current interviewee.
+        """
+        session = session_maker()
+        server = session.query(schema.Server).filter_by(id=ctx.guild.id).one_or_none()  # type: schema.Server
+        audience_role = ctx.guild.get_role(server.audience_role_id)
+        if not audience_role:
+            await ctx.send(f"No audience role set up for {ctx.guild}.")
+            await ctx.message.add_reaction(ctx.bot.redtick)
+            return
+        for mention in mentions:  # type: discord.Member
+            await mention.add_roles(audience_role, reason=f"enroled by grantstage command used by {ctx.author}.")
+        await ctx.message.add_reaction(ctx.bot.greentick)
+
+    @commands.command()
+    @_ck_server_active()
+    @_ck_is_interviewee()
+    async def revokestage(self, ctx: commands.Context, mentions: commands.Greedy[discord.Member]):
+        """
+        Revoke interview stage permissions from all mentioned users.
+
+        Usable only by the current interviewee.
+        """
+        session = session_maker()
+        server = session.query(schema.Server).filter_by(id=ctx.guild.id).one_or_none()  # type: schema.Server
+        audience_role = ctx.guild.get_role(server.audience_role_id)
+        if not audience_role:
+            await ctx.send(f"No audience role set up for {ctx.guild}.")
+            await ctx.message.add_reaction(ctx.bot.redtick)
+            return
+        for mention in mentions:  # type: discord.Member
+            await mention.remove_roles(audience_role, reason=f"revoked by revokestage command used by {ctx.author}.")
+        await ctx.message.add_reaction(ctx.bot.greentick)
+
+    @commands.command()
+    @_ck_server_active()
+    @_ck_is_interviewee()
+    async def lsstage(self, ctx: commands.Context):
+        """
+        List all members who have interview stage permissions.
+
+        Usable only by the current interviewee.
+        """
+        session = session_maker()
+        server = session.query(schema.Server).filter_by(id=ctx.guild.id).one_or_none()  # type: schema.Server
+        audience_role = ctx.guild.get_role(server.audience_role_id)
+        if not audience_role:
+            await ctx.send(f"No audience role set up for {ctx.guild}.")
+            await ctx.message.add_reaction(ctx.bot.redtick)
+            return
+        members = "\n".join((str(member) for member in audience_role.members))
+        try:
+            await ctx.send(f"```\n{members}\n```")
+        except:
+            await ctx.send(
+                f"Too many people on stage to list ({len(audience_role.members)}. Consider `clearstage`."
+            )
+
+    @commands.command()
+    @_ck_server_active()
+    @_ck_is_interviewee()
+    async def clearstage(self, ctx: commands.Context):
+        """
+        Remove all interview audience members from the stage.
+
+        Usable only by the current interviewee.
+        """
+        session = session_maker()
+        server = session.query(schema.Server).filter_by(id=ctx.guild.id).one_or_none()  # type: schema.Server
+        audience_role = ctx.guild.get_role(server.audience_role_id)
+        if not audience_role:
+            await ctx.send(f"No audience role set up for {ctx.guild}.")
+            await ctx.message.add_reaction(ctx.bot.redtick)
+            return
+        for member in audience_role.members:  # type: discord.Member
+            await member.remove_roles(audience_role, reason=f"clearstage used by {ctx.author}")
+        await ctx.message.add_reaction(ctx.bot.greentick)
 
     # == Votes ==
 
